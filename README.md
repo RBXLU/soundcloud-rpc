@@ -1,6 +1,6 @@
 # soundcloud-rpc
 
-**[English](#english) · [Русский](#русский)**
+**[English](#english) · [Русский](#русский) · [Website](https://rbxlu.github.io/soundcloud-rpc/)**
 
 Discord Rich Presence for SoundCloud on Linux — shows what you're listening to
 in the browser as **"Listening to SoundCloud"**, with the track title, artist,
