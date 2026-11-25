@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+"""soundcloud-rpc — SoundCloud → Discord Rich Presence for Linux.
+
+Reads the currently playing SoundCloud track from the browser over MPRIS
+(D-Bus) and shows it in your Discord status as "Listening to SoundCloud":
+title, artist, artwork, progress bar and a "Listen" button.
+
+No third-party libraries: only python-dbus and the Discord IPC socket.
+
+Your Discord application ID goes into ~/.config/soundcloud-rpc/client_id
+"""
+
+import json
+import locale
+import os
+import socket
+import struct
+import sys
+import time
+import urllib.parse
+import urllib.request
+import uuid
+
+import dbus
+
+__version__ = "1.0.0"
+
+CONFIG = os.path.expanduser("~/.config/soundcloud-rpc/client_id")
+POLL = 3            # seconds between player checks
+ART_RETRY = 30      # seconds before retrying a failed artwork lookup
+SC_LOGO = "https://a-v2.sndcdn.com/assets/images/sc-icons/ios-a62dfc8fe7.png"
+PLAYER = "org.mpris.MediaPlayer2.Player"
+
+
+def log(msg):
+    print(msg, flush=True)  # goes to the journal: journalctl --user -u soundcloud-rpc
+
+
+def button_label():
+    lang = (os.environ.get("LANG") or locale.getlocale()[0] or "").lower()
+    if lang.startswith(("ru", "uk", "be")):
+        return "Слушать в SoundCloud"
+    return "Listen on SoundCloud"
+
+
+# ---------- Discord IPC ----------
+
+class Discord:
+    def __init__(self, client_id):
+        self.client_id = client_id
+        self.sock = None
+
+    def _send(self, op, payload):
+        data = json.dumps(payload).encode()
+        self.sock.sendall(struct.pack("<II", op, len(data)) + data)
+
+    def _recv(self):
+        op, length = struct.unpack("<II", self._read(8))
+        return op, json.loads(self._read(length))
+
+    def _read(self, n):
+        buf = b""
+        while len(buf) < n:
+            chunk = self.sock.recv(n - len(buf))
+            if not chunk:
+                raise ConnectionError("Discord closed the connection")
+            buf += chunk
+        return buf
+
+    def connect(self):
+        base = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+        # native, Flatpak and Snap builds of Discord keep the socket in different places
+        dirs = [base, f"{base}/app/com.discordapp.Discord", f"{base}/snap.discord"]
+        for d in dirs:
+            for i in range(10):
+                path = f"{d}/discord-ipc-{i}"
+                if not os.path.exists(path):
+                    continue
+                try:
+                    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    s.settimeout(5)
+                    s.connect(path)
+                    self.sock = s
+                    self._send(0, {"v": 1, "client_id": self.client_id})
+                    _, resp = self._recv()
+                    if resp.get("evt") == "READY":
+                        log(f"connected to Discord ({path})")
+                        return True
+                    log(f"Discord refused the handshake: {resp.get('data', resp)}")
+                    s.close()
+                except (OSError, ValueError, struct.error):
+                    pass
+        self.sock = None
+        return False
+
+    def set_activity(self, activity):
+        args = {"pid": os.getpid()}
+        if activity:
+            args["activity"] = activity
+        self._send(1, {"cmd": "SET_ACTIVITY", "args": args, "nonce": str(uuid.uuid4())})
+        _, resp = self._recv()
+        if resp.get("evt") == "ERROR":
+            log(f"Discord rejected the activity: {resp.get('data')}")
+
+    def close(self):
+        if self.sock:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+        self.sock = None
+
+
+# ---------- browser / MPRIS ----------
+
+def current_track(bus):
+    """Return the SoundCloud track: a playing one wins over a paused one."""
+    found = None
+    for name in bus.list_names():
+        if not name.startswith("org.mpris.MediaPlayer2."):
+            continue
+        try:
+            obj = bus.get_object(name, "/org/mpris/MediaPlayer2")
+            props = dbus.Interface(obj, "org.freedesktop.DBus.Properties")
+            md = props.Get(PLAYER, "Metadata")
+            url = str(md.get("xesam:url", ""))
+            host = urllib.parse.urlparse(url).netloc
+            if host != "soundcloud.com" and not host.endswith(".soundcloud.com"):
+                continue
+            status = str(props.Get(PLAYER, "PlaybackStatus"))
+            try:
+                pos = int(props.Get(PLAYER, "Position")) / 1e6
+            except dbus.DBusException:
+                pos = None
+            length = md.get("mpris:length")
+            track = {
+                "title": str(md.get("xesam:title", "")) or "SoundCloud",
+                "artist": ", ".join(str(a) for a in md.get("xesam:artist", [])),
+                "album": str(md.get("xesam:album", "")),
+                "url": url,
+                "status": status,
+                "pos": pos,
+                "length": int(length) / 1e6 if length else None,
+            }
+        except dbus.DBusException:
+            continue
+        if track["status"] == "Playing":
+            return track
+        found = found or track
+    return found
+
+
+_art_cache = {}   # track url -> artwork url
+_art_failed = {}  # track url -> time of the last failed lookup
+
+
+def artwork(url):
+    """Track artwork via SoundCloud's public oEmbed endpoint.
+
+    Successful lookups are cached. A failure is not cached: we fall back to
+    the SoundCloud logo and retry after ART_RETRY seconds.
+    """
+    if url in _art_cache:
+        return _art_cache[url]
+    if time.time() - _art_failed.get(url, 0) < ART_RETRY:
+        return SC_LOGO
+    try:
+        q = urllib.parse.urlencode({"url": url, "format": "json"})
+        with urllib.request.urlopen(f"https://soundcloud.com/oembed?{q}", timeout=5) as r:
+            thumb = json.load(r).get("thumbnail_url")
+        if thumb and thumb.startswith("https://"):
+            _art_cache[url] = thumb
+            _art_failed.pop(url, None)
+            return thumb
+    except Exception as e:  # network errors, bad JSON, HTTP errors — all non-fatal
+        log(f"artwork lookup failed ({e!r}), retrying in {ART_RETRY}s")
+    _art_failed[url] = time.time()
+    return SC_LOGO
+
+
+def build_activity(t):
+    assets = {"large_image": artwork(t["url"])}
+    if t.get("album"):
+        # the third line on the profile card; omitted when there is no album
+        assets["large_text"] = t["album"][:128]
+    activity = {
+        "type": 2,  # "Listening to"
+        "details": t["title"][:128],
+        "state": (t["artist"] or "SoundCloud")[:128],
+        "assets": assets,
+        "buttons": [{"label": button_label(), "url": t["url"][:512]}],
+    }
+    if t["status"] == "Playing" and t["pos"] is not None:
+        start = time.time() - t["pos"]
+        activity["timestamps"] = {"start": int(start)}
+        if t["length"]:
+            activity["timestamps"]["end"] = int(start + t["length"])
+    return activity
+
+
+# ---------- main loop ----------
+
+def read_client_id():
+    try:
+        with open(CONFIG) as f:
+            client_id = f.read().strip()
+    except FileNotFoundError:
+        sys.exit(f"No Discord application ID: put it into {CONFIG}")
+    if not client_id.isdigit():
+        sys.exit(f"{CONFIG} must contain a numeric Discord application ID")
+    return client_id
+
+
+def main():
+    if "--version" in sys.argv:
+        print(f"soundcloud-rpc {__version__}")
+        return
+
+    discord = Discord(read_client_id())
+    bus = dbus.SessionBus()
+    shown = None  # (track url, title, start time, artwork) currently on the profile
+
+    while True:
+        try:
+            if not discord.sock and not discord.connect():
+                shown = None
+                time.sleep(15)
+                continue
+
+            t = current_track(bus)
+            if not t or t["status"] != "Playing":
+                if shown is not None:
+                    discord.set_activity(None)
+                    shown = None
+            else:
+                start = int(time.time() - (t["pos"] or 0))
+                new_track = shown is None or shown[:2] != (t["url"], t["title"])
+                seeked = shown is not None and abs(shown[2] - start) > 3
+                art_pending = (shown is not None and shown[3] == SC_LOGO
+                               and time.time() - _art_failed.get(t["url"], 0) >= ART_RETRY)
+                if new_track or seeked or art_pending:
+                    activity = build_activity(t)
+                    discord.set_activity(activity)
+                    art = activity["assets"]["large_image"]
+                    if new_track:
+                        log(f"▶ {t['artist']} — {t['title']}")
+                    shown = (t["url"], t["title"], start, art)
+        except (OSError, ConnectionError, ValueError, struct.error):
+            discord.close()
+            shown = None
+        except dbus.DBusException:
+            pass
+        time.sleep(POLL)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
